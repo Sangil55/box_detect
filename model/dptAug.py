@@ -89,7 +89,7 @@ class Reconstruct_body(nn.Module):
         self.up4 = (Up(128//widefactor, 128//widefactor, bilinear, wide_factor=1))
 
         # self.flatten = nn.Flatten()
-        self.outc = (OutConv(128, n_classes))
+        self.outc = (OutConv(128//widefactor, 3))
 
     def forward(self, x):
         x1 = self.inc(x)
@@ -103,7 +103,7 @@ class Reconstruct_body(nn.Module):
         x = self.up4(x, x1)
 
         if self.mode == 'pretrain' or self.mode == 'segment':
-            return x
+            return self.outc(x)
         elif self.mode == 'classify':
             return x5
         # elif self.mode == 'segment':
