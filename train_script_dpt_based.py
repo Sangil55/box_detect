@@ -22,7 +22,7 @@ from data.dataset import Driftset
 from midas.run import load_model_dpt
 from model.metric import BinaryMetrics, SegmentationMetrics
 from model.resnet import BasicBlock, ResNet
-from model.semantic_loss_functions import CrossentropyND
+from model.semantic_loss_functions import CrossentropyND, SoftDiceLoss
 from model.unet import UNet
 from model.dptAug import dptAug
 from torchsummary import summary
@@ -178,7 +178,8 @@ def train_model_seg(
 
             recon_img , seg_img = model(images)
             # seg_img = seg_img.permute(0,2,3,1)
-            loss = CrossentropyND()(seg_img,y)
+            # loss = CrossentropyND(redution='sum')(seg_img,y)
+            loss = SoftDiceLoss(reduction = 'mean',use_softmax=False)(seg_img,y)
             # loss = torch.norm (recon_img-images)
             losssum += loss
 
@@ -190,7 +191,7 @@ def train_model_seg(
             
             counter+=1
             if counter % 20 == 19:
-                n_classes = seg_img.shape[-1]
+                n_classes = seg_img.shape[1]
                 print('\r'+str(epoch)+'th_epoch Loss : %.3f, avg loss : %.3f'%(loss,losssum/(counter+1)) ,end='')
                 pixel_acc, dice, precision, recall = seg_metric (y.view(-1,),seg_img.reshape(-1,n_classes) )
                 print( ' ', '%.3f, %.3f, %.3f, %.3f'%(pixel_acc, dice, precision, recall) ,end = '')
@@ -204,7 +205,7 @@ def train_model_seg(
 
                     real_img = images[0].permute(1,2,0).cpu().detach().numpy()
                     y_img = y[0].cpu().detach().numpy()
-                    predicted = seg_img[0].argmax(-1).cpu().detach().numpy()
+                    predicted = seg_img.permute(0,2,3,1)[0].argmax(-1).cpu().detach().numpy()
                     last_depth = model.get_last_hook()[0].cpu().detach().numpy()
 
                     f, axarr = plt.subplots(2,2)
@@ -223,9 +224,80 @@ def train_model_seg(
         print('\n')
 
 
-def train_model_OOG(
+def kart_inference(
         model,
         device,
+        train_loader,
+        fold,
+        epochs: int = 5,
+        batch_size: int = 1,
+        learning_rate: float = 1e-5,
+        val_percent: float = 0.1,
+        save_checkpoint: bool = True,
+        img_scale: float = 0.5,
+        amp: bool = False,
+        weight_decay: float = 1e-8,
+        momentum: float = 0.999,
+        gradient_clipping: float = 1.0,
+):
+     # 1. Create dataset
+   
+    # (Initialize logging)
+
+    logging.info(f'''Starting training:
+        Epochs:          {epochs}
+        Batch size:      {batch_size}
+        Learning rate:   {learning_rate}
+        Training size:   {n_train}
+        Checkpoints:     {save_checkpoint}
+        Device:          {device.type}
+        Images scaling:  {img_scale}
+        Mixed Precision: {amp}
+    ''')
+
+    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
+    # optimizer = optim.RMSprop(model.parameters(),
+                            #   lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    
+    optimizer = optim.Adam(model.parameters(),lr=learning_rate, weight_decay=weight_decay, foreach=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    global_step = 0
+    best  =0
+    metric = MulticlassConfusionMatrix(num_classes=cfg.n_class)
+    metric.to(device)
+    # 5. Begin training
+    losssum = 0
+    counter = 0
+    for epoch in range(1, epochs + 1):
+      
+        for batch in train_loader:
+            images, y = batch
+            images = (images/255).to(device=device, dtype=torch.float32)
+            y = y.to(device=device, dtype=torch.long)
+
+
+            recon_img , seg_img = model(images)
+            
+
+            f, axarr = plt.subplots(1,3)
+            real_img = images[0].permute(1,2,0).cpu().detach().numpy()
+            predicted = seg_img.permute(0,2,3,1)[0].argmax(-1).cpu().detach().numpy()
+            last_depth = model.get_last_hook()[0].cpu().detach().numpy()
+            axarr[0].imshow(real_img)
+            axarr[1].imshow(predicted)
+            axarr[2].imshow(last_depth)
+            plt.show()
+            counter += 1
+            # print('\r'+str(epoch)+'th_epoch Loss : %.3f'%(loss) ,end='')
+            # s = F.sigmoid(outputs)
+        print('\n')
+
+
+def train_model_OOG(
+        model,
+        device, 
         train_loader,
         val_loader,
         fold,
@@ -380,6 +452,7 @@ if __name__ == '__main__':
     filenames = [os.path.join(srcpath,'box_val_X_fold' + str(i)+'_256.npy') for i in range(K)]
     filenamesY = [os.path.join(srcpath,'box_val_Y_fold' + str(i)+'_256.npy') for i in range(K)]
     
+    model = False
 
     # filelist = []
     for i in range(1):
@@ -393,13 +466,13 @@ if __name__ == '__main__':
         trainlistY = filenamesY[0:i] + filenamesY[i+1:K]
         vallistY = filenamesY
         
-        train_X = readNConcat(vallist)[:,:,:,0:3]
-        train_Y = readNConcat(vallistY)
-        dftrainset = Driftset(train_X,train_Y)
+        train_X_kart = readNConcat(vallist)[:,:,:,0:3]
+        train_Y_kart = readNConcat(vallistY)
+        dftrainset = Driftset(train_X_kart,train_Y_kart)
         
         batch_size = 8
         global n_train
-        n_train = len(train_Y)
+        n_train = len(train_Y_kart)
 
         iter_train = torch.utils.data.DataLoader(dftrainset, batch_size=batch_size,
                                              shuffle=True, pin_memory=False)
@@ -411,7 +484,7 @@ if __name__ == '__main__':
         if i== 0:
             summary(model, (3,) + cfg.d_size)
 
-        # train_model(model,device,iter_train,fold=i,batch_size=batch_size,epochs = 200,learning_rate=0.001)
+        train_model(model,device,iter_train,fold=i,batch_size=batch_size,epochs = 200,learning_rate=0.001)
         
         ##########################################################
         #########stage2 : Depth ->Segment (optional)##########
@@ -444,12 +517,38 @@ if __name__ == '__main__':
         model = dptAug(dpt_model,mode='segment', seg_label_num = l_max)
         model = model.to(device=device)
         
-        train_model_seg(model,device,iter_train,fold=i,batch_size=batch_size,epochs = 200,learning_rate=0.001)
+        # train_model_seg(model,device,iter_train,fold=i,batch_size=batch_size,epochs = 200,learning_rate=0.001)
         
-        
+
+         
+        ##########################################################
+        ##############stage3 : kartlider segment #################
+        ##########################################################
+        if True:
+            #load exist model 
+            dpt_model,_,_,_ = load_model_dpt(device=device,model_path=cfg.depth_model_path,model_type=cfg.depth_model_type)
+            model = dptAug(dpt_model,mode='segment')
+            PATH = 'pretrain_dpt.pth'
+            model.load_state_dict(torch.load(PATH))
+            model.eval()
+            model = model.to(device=device)
+
+        vallist = filenames[0]
+        vallistY = filenamesY[0]
+        train_X = train_X_kart
+        train_Y = train_Y_kart
+        dftrainset = Driftset(train_X,train_Y)
+        iter_train = torch.utils.data.DataLoader(dftrainset, batch_size=batch_size,
+                                            shuffle=True, pin_memory=False)
+
+        kart_inference(model,device,iter_train,fold=i,batch_size=1,epochs = 1,learning_rate=0.001)
+
+    
         ##########################################################
         ###########stage3 : Abnormal classification ##############
         ##########################################################
+
+
         
         idx_0 = train_Y==0
         train_X = train_X[idx_0]
@@ -483,7 +582,7 @@ if __name__ == '__main__':
         train_model_OOG(model,device,iter_train,iter_val,fold=i,batch_size=batch_size,epochs = 10)
 
 
-        print('-' * 50)
+        # print('-' * 50)
 
 
         
